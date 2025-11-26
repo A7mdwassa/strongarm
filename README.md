@@ -1,0 +1,59 @@
+# whiterabb17/strongarm
+ Simple tool to bruteforce (spray actually) different network protocols.
+ whiterabb17/strongarm also supports restoration of interrupted tasks ("-restore").
+ 
+ whiterabb17/strongarm currently supports: **rdp, ssh, ftp, Windows LDAP, http basic** and **digest authentication**
+
+
+```
+go run . -ul testUsernames.txt -pl testPasswords.txt -p ftp -tl targets.txt -w 10
+---------------+
+Success: 192.168.56.102:user:123
+-------------------
+```
+
+
+```
+go run . -ul testUsernames.txt -pl testPasswords.txt -p ftp -tl targets.txt -w 10
+--------
+
+CTRL+C
+
+go run . -restore
+-------+
+Success: user:123
+-------------------
+```
+
+-ul   Path to file with **usernames**
+
+-ul   Path to file with **passwords**
+
+-p   Protocol to brute ( winldap, rdp, ssh, ftp, httpbasic, httpdigest )
+
+-t   Target host. http://127.0.0.1:667/protected/folder/
+
+-w   Number of workers (threads)
+
+-restore use "progress.gob" to restore task
+ 
+
+**Target Formats:**
+
+```
+192.168.56.102 - for **ssh, rdp, ldap, ftp**
+
+192.168.56.102:21 - for **ssh, rdp, ldap, ftp**
+
+http://192.168.56.102:80/2 - for **basic** and **digest authentication**
+```
+ 
+**Examples:**
+
+```
+strongarm.exe -ul testUsernames.txt -pl testPasswords.txt -p ssh -tl targets.txt -w 10
+
+strongarm.exe -ul testUsernames.txt -pl testPasswords.txt -p httpbasic -tl targets.txt -w 10 -ru -rp
+
+strongarm.exe -restore
+```
