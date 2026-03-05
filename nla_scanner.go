@@ -258,7 +258,7 @@ func (s *NLAScanner) scanOnce(host string, port int) (NLAScanStatus, error) {
 		return NLAStatusError, errors.New("TPKT too short")
 	}
 	tpktLen := binary.BigEndian.Uint16(buf[2:4])
-	if int(tpktLen) > n {
+	if tpktLen < 4 || int(tpktLen) > n {
 		return NLAStatusError, errors.New("incomplete TPKT")
 	}
 	tpduData := buf[4:tpktLen]
