@@ -1,3 +1,4 @@
+//grdp/emission/emitter.go
 package emission
 
 import (

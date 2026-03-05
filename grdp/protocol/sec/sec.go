@@ -1,3 +1,4 @@
+//grdp/protocol/sec/sec.go
 package sec
 
 import (

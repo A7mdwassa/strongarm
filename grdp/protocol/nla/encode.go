@@ -1,3 +1,4 @@
+//grdp/protocol/nla/encode.go
 package nla
 
 import (

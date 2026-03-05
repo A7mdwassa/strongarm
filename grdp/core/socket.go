@@ -1,3 +1,4 @@
+//grdp/core/socket.go
 package core
 
 import (

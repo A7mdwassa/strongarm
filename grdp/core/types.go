@@ -1,3 +1,4 @@
+//grdp/core/types.go
 package core
 
 import "github.com/whiterabb17/strongarm/grdp/emission"

@@ -1,4 +1,4 @@
-// rfb.go
+//grdp/protocol/rfb/rfb.go
 package rfb
 
 import (

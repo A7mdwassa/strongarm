@@ -1,4 +1,5 @@
-//grdp/grdp.go
+// grdp/grdp.go - Optimized RDP client with improved timeout and connection handling
+
 package grdp
 
 import (
@@ -18,75 +19,98 @@ import (
 	"github.com/whiterabb17/strongarm/grdp/protocol/x224"
 )
 
+// Client represents an RDP client connection
 type Client struct {
-	Host string
-	tpkt *tpkt.TPKT
-	x224 *x224.X224
-	mcs  *t125.MCSClient
-	sec  *sec.Client
-	pdu  *pdu.Client
-	conn net.Conn // ADD THIS - store the underlying connection
-	mu   sync.Mutex // ADD THIS - for thread-safe closing
-	closed bool // ADD THIS - track if already closed
+	Host   string
+	tpkt   *tpkt.TPKT
+	x224   *x224.X224
+	mcs    *t125.MCSClient
+	sec    *sec.Client
+	pdu    *pdu.Client
+	conn   net.Conn
+	mu     sync.Mutex
+	closed bool
 }
 
+// NewClient creates a new RDP client
 func NewClient(host string, logLevel glog.LEVEL) *Client {
 	glog.SetLevel(logLevel)
 	return &Client{Host: host}
 }
 
+// Close cleanly closes all client connections and resources
 func (g *Client) Close() error {
-    g.mu.Lock()
-    defer g.mu.Unlock()
-    
-    if g.closed {
-        return nil
-    }
-    
-    g.closed = true
-    
-    var lastErr error
-    
-    // Force close underlying connection FIRST (most important!)
-    if g.conn != nil {
-        // Set immediate deadline to force any blocking reads/writes to fail
-        g.conn.SetDeadline(time.Now().Add(50 * time.Millisecond))
-        
-        if err := g.conn.Close(); err != nil {
-            glog.Debug("Error closing connection:", err)
-            lastErr = err
-        }
-        g.conn = nil
-    }
-    
-    // Then close TPKT layer (might fail, that's ok)
-    if g.tpkt != nil {
-        if err := g.tpkt.Close(); err != nil {
-            glog.Debug("Error closing TPKT:", err)
-        }
-        g.tpkt = nil
-    }
-    
-    // Clear all references to help GC
-    g.x224 = nil
-    g.mcs = nil
-    g.sec = nil
-    g.pdu = nil
-    
-    return lastErr
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.closed {
+		return nil
+	}
+
+	g.closed = true
+
+	// Close underlying connection with proper cleanup
+	if g.conn != nil {
+		// Set immediate deadline to force any blocking reads/writes to fail
+		g.conn.SetDeadline(time.Now())
+
+		// Try to set TCP keepalive to 0 (disable) and linger options
+		if tcpConn, ok := g.conn.(*net.TCPConn); ok {
+			// Disable keepalive to speed up close
+			tcpConn.SetKeepAlive(false)
+			// Set linger to 0 for immediate close (forces RST instead of FIN)
+			// This releases port immediately but is less graceful
+			tcpConn.SetLinger(0)
+		}
+
+		g.conn.Close()
+		g.conn = nil
+	}
+
+	// Clear protocol layers
+	if g.tpkt != nil {
+		g.tpkt.Close()
+		g.tpkt = nil
+	}
+
+	// Nil out references for GC
+	g.x224 = nil
+	g.mcs = nil
+	g.sec = nil
+	g.pdu = nil
+
+	return nil
 }
 
+// isClosed checks if the client is already closed (must be called with lock held)
+func (g *Client) isClosed() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.closed
+}
+
+// LoginForSSL attempts authentication using SSL/TLS (NLA)
+// Returns nil on success, error on failure
 func (g *Client) LoginForSSL(domain, user, pwd string) error {
-	// Reduced timeout for faster failure detection
-	conn, err := net.DialTimeout("tcp", g.Host, 5*time.Second)
+	// Quick connection timeout for speed
+	conn, err := net.DialTimeout("tcp", g.Host, 3*time.Second)
 	if err != nil {
 		return fmt.Errorf("connection failed: %v", err)
 	}
-	g.conn = conn // STORE the connection for later closing
-	
-	// Set read/write deadlines for faster timeout
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
 
+	g.mu.Lock()
+	if g.closed {
+		g.mu.Unlock()
+		conn.Close()
+		return errors.New("client closed")
+	}
+	g.conn = conn
+	g.mu.Unlock()
+
+	// Set aggressive timeouts for faster failure detection
+	conn.SetDeadline(time.Now().Add(8 * time.Second))
+
+	// Initialize protocol stack
 	g.tpkt = tpkt.New(core.NewSocketLayer(conn), nla.NewNTLMv2(domain, user, pwd))
 	g.x224 = x224.New(g.tpkt)
 	g.mcs = t125.NewMCSClient(g.x224)
@@ -101,33 +125,39 @@ func (g *Client) LoginForSSL(domain, user, pwd string) error {
 	g.sec.SetFastPathListener(g.pdu)
 	g.pdu.SetFastPathSender(g.tpkt)
 
-	err = g.x224.Connect()
-	if err != nil {
-	    g.Close()
+	// Connect X224 layer
+	if err := g.x224.Connect(); err != nil {
+		g.Close()
 		return fmt.Errorf("x224 connect failed: %v", err)
 	}
 
-	// Use channel with timeout instead of WaitGroup for faster response
+	// Wait for authentication result with timeout
 	done := make(chan error, 1)
-	
+	var resultErr error
+
 	g.pdu.On("error", func(e error) {
+		resultErr = e
 		select {
 		case done <- e:
 		default:
 		}
 	})
+
 	g.pdu.On("close", func() {
+		resultErr = errors.New("connection closed")
 		select {
-		case done <- errors.New("connection closed"):
+		case done <- resultErr:
 		default:
 		}
 	})
+
 	g.pdu.On("success", func() {
 		select {
 		case done <- nil:
 		default:
 		}
 	})
+
 	g.pdu.On("ready", func() {
 		select {
 		case done <- nil:
@@ -135,30 +165,41 @@ func (g *Client) LoginForSSL(domain, user, pwd string) error {
 		}
 	})
 
-	// Wait with timeout
+	// Wait for result or timeout
 	select {
-	case err = <-done:
-	    if err != nil {
-			g.Close() // Clean up on error
+	case err := <-done:
+		if err != nil {
+			g.Close()
 		}
 		return err
-	case <-time.After(4 * time.Second):
-	    g.Close()
+	case <-time.After(5 * time.Second):
+		g.Close()
 		return errors.New("authentication timeout")
 	}
 }
 
+// LoginForRDP attempts authentication using standard RDP protocol (fallback)
+// Returns nil on success, error on failure
 func (g *Client) LoginForRDP(domain, user, pwd string) error {
-	// Reduced timeout for faster failure detection
-	conn, err := net.DialTimeout("tcp", g.Host, 3*time.Second)
+	// Quick connection timeout
+	conn, err := net.DialTimeout("tcp", g.Host, 2*time.Second)
 	if err != nil {
 		return fmt.Errorf("connection failed: %v", err)
 	}
-	g.conn = conn // STORE the connection for later closing
 
-	// Set read/write deadlines
+	g.mu.Lock()
+	if g.closed {
+		g.mu.Unlock()
+		conn.Close()
+		return errors.New("client closed")
+	}
+	g.conn = conn
+	g.mu.Unlock()
+
+	// Set aggressive timeouts
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
+	// Initialize protocol stack
 	g.tpkt = tpkt.New(core.NewSocketLayer(conn), nla.NewNTLMv2(domain, user, pwd))
 	g.x224 = x224.New(g.tpkt)
 	g.mcs = t125.NewMCSClient(g.x224)
@@ -173,70 +214,86 @@ func (g *Client) LoginForRDP(domain, user, pwd string) error {
 	g.sec.SetFastPathListener(g.pdu)
 	g.pdu.SetFastPathSender(g.tpkt)
 
+	// Use standard RDP protocol (not NLA)
 	g.x224.SetRequestedProtocol(x224.PROTOCOL_RDP)
 
-	err = g.x224.Connect()
-	if err != nil {
-	    g.Close()
+	// Connect X224 layer
+	if err := g.x224.Connect(); err != nil {
+		g.Close()
 		return fmt.Errorf("x224 connect failed: %v", err)
 	}
 
-	wg := &sync.WaitGroup{}
-	breakFlag := false
-	updateCount := 0
-	wg.Add(1)
+	// Wait for authentication result
+	done := make(chan struct{})
+	var authErr error
+	var updateCount int
+	var mu sync.Mutex
 
 	g.pdu.On("error", func(e error) {
-		err = e
-		g.pdu.Emit("done")
+		mu.Lock()
+		authErr = e
+		mu.Unlock()
+		close(done)
 	})
+
 	g.pdu.On("close", func() {
-		err = errors.New("connection closed")
-		g.pdu.Emit("done")
+		mu.Lock()
+		authErr = errors.New("connection closed")
+		mu.Unlock()
+		close(done)
 	})
+
 	g.pdu.On("success", func() {
-		err = nil
-		g.pdu.Emit("done")
+		close(done)
 	})
+
 	g.pdu.On("update", func(rectangles []pdu.BitmapData) {
+		mu.Lock()
 		updateCount++
-	})
-	g.pdu.On("done", func() {
-		if !breakFlag {
-			breakFlag = true
-			wg.Done()
-		}
+		mu.Unlock()
 	})
 
-	// Reduced wait time
-	time.Sleep(3 * time.Second)
-	if !breakFlag {
-		breakFlag = true
-		wg.Done()
+	// Wait for completion or timeout
+	select {
+	case <-done:
+		// Event triggered
+	case <-time.After(3 * time.Second):
+		// Timeout - check if we got updates (indicates successful auth)
 	}
-	wg.Wait()
 
-    if err != nil {
-			g.Close() // Clean up on error
-    }
+	mu.Lock()
+	finalUpdates := updateCount
+	mu.Unlock()
 
-	if updateCount > 50 {
+	// Close connection
+	g.Close()
+
+	// If we received screen updates, authentication likely succeeded
+	if finalUpdates > 0 {
 		return nil
 	}
+
+	if authErr != nil {
+		return authErr
+	}
+
 	return errors.New("authentication failed")
 }
 
+// Login attempts SSL authentication first, then falls back to RDP
 func Login(target, domain, username, password string) error {
 	g := NewClient(target, glog.NONE)
 	defer g.Close()
-	err := g.LoginForSSL(domain, username, password)
-	if err == nil {
+
+	// Try SSL/NLA first (more common in modern environments)
+	if err := g.LoginForSSL(domain, username, password); err == nil {
 		return nil
 	}
-	
-	err = g.LoginForRDP(domain, username, password)
-	if err == nil {
+
+	// Fallback to standard RDP
+	if err := g.LoginForRDP(domain, username, password); err == nil {
 		return nil
 	}
-	return err
+
+	return errors.New("all authentication methods failed")
 }

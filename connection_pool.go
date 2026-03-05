@@ -1,4 +1,4 @@
-// Create new file: connection_pool.go
+// connection_pool.go - Connection monitoring and throttling
 
 package main
 
@@ -18,18 +18,21 @@ type ConnectionMonitor struct {
 	mu                sync.RWMutex
 	startTime         time.Time
 	peakConnections   int64
+	throttleWarnings  int64
+	globalRateLimit   int64 // Global rate limit counter
+	lastGlobalCheck   int64 // Unix timestamp of last rate check
 }
 
 var globalMonitor = &ConnectionMonitor{
 	startTime: time.Now(),
 }
 
-// IncrementActive - call when creating a connection
+// IncrementActive increments the active connection counter and tracks peak
 func (cm *ConnectionMonitor) IncrementActive() {
 	current := atomic.AddInt64(&cm.activeConnections, 1)
 	atomic.AddInt64(&cm.totalAttempted, 1)
-	
-	// Track peak
+
+	// Atomically track peak connections
 	for {
 		peak := atomic.LoadInt64(&cm.peakConnections)
 		if current <= peak {
@@ -39,212 +42,166 @@ func (cm *ConnectionMonitor) IncrementActive() {
 			break
 		}
 	}
+
+	// Update global rate limit counter
+	atomic.AddInt64(&cm.globalRateLimit, 1)
 }
 
-// DecrementActive - call when closing a connection
+// DecrementActive decrements the active connection counter
 func (cm *ConnectionMonitor) DecrementActive() {
 	atomic.AddInt64(&cm.activeConnections, -1)
 }
 
-// RecordSuccess - call on successful login
+// RecordSuccess increments the success counter
 func (cm *ConnectionMonitor) RecordSuccess() {
 	atomic.AddInt64(&cm.totalSucceeded, 1)
 }
 
-// RecordFailure - call on failed login
+// RecordFailure increments the failure counter
 func (cm *ConnectionMonitor) RecordFailure() {
 	atomic.AddInt64(&cm.totalFailed, 1)
 }
 
-// GetActiveCount returns current active connections
+// GetActiveCount returns the current number of active connections
 func (cm *ConnectionMonitor) GetActiveCount() int64 {
 	return atomic.LoadInt64(&cm.activeConnections)
 }
 
-// ShouldThrottle determines if we should slow down based on active connections
-func (cm *ConnectionMonitor) ShouldThrottle() bool {
-	active := cm.GetActiveCount()
-	
-	// On Windows, throttle if we have more than 5000 active connections
-	// This prevents port exhaustion
-	const MAX_SAFE_CONNECTIONS = 5000000
-	
-	return active > MAX_SAFE_CONNECTIONS
+// GetPeakCount returns the peak number of active connections
+func (cm *ConnectionMonitor) GetPeakCount() int64 {
+	return atomic.LoadInt64(&cm.peakConnections)
 }
 
-// GetThrottleDelay returns how long to wait before creating new connection
+// ShouldThrottle determines if we should slow down based on active connections
+// Windows ephemeral port range is typically 16384-32767 (16384 ports)
+// We throttle well before exhaustion to prevent connection failures
+func (cm *ConnectionMonitor) ShouldThrottle() bool {
+	active := cm.GetActiveCount()
+
+	// Conservative thresholds for Windows
+	// Default ephemeral port range: 16384-32767 (16384 ports)
+	// Start throttling at 50% utilization
+	const THROTTLE_THRESHOLD = 8000
+
+	return active > THROTTLE_THRESHOLD
+}
+
+// GetThrottleDelay returns the delay to apply based on connection pressure
 func (cm *ConnectionMonitor) GetThrottleDelay() time.Duration {
 	active := cm.GetActiveCount()
-	
+
+	// Windows default ephemeral port range: 16384-32767 (16384 ports)
+	// Adjust thresholds based on port exhaustion risk
 	switch {
+	case active > 10000:
+		// Critical: 60%+ port utilization - aggressive throttle
+		atomic.AddInt64(&cm.throttleWarnings, 1)
+		return 2 * time.Second
 	case active > 8000:
-		return 500 * time.Millisecond // Severe throttle
+		// High: 50%+ port utilization
+		return 1 * time.Second
 	case active > 6000:
-		return 200 * time.Millisecond // Heavy throttle
-	case active > 5000:
-		return 100 * time.Millisecond // Light throttle
+		// Medium: 35%+ port utilization
+		return 500 * time.Millisecond
+	case active > 4000:
+		// Light: 25%+ port utilization
+		return 200 * time.Millisecond
 	default:
-		return 0 // No throttle
+		return 0
 	}
 }
 
-// GetStats returns formatted statistics
+// ShouldApplyGlobalRateLimit checks if we should apply global rate limiting
+// This prevents overwhelming target networks with too many attempts per second
+func (cm *ConnectionMonitor) ShouldApplyGlobalRateLimit() bool {
+	// Rate limit: max 1000 attempts per second globally
+	const GLOBAL_RATE_LIMIT = 1000
+
+	currentTime := time.Now().Unix()
+	lastCheck := atomic.LoadInt64(&cm.lastGlobalCheck)
+
+	// Reset counter every second
+	if currentTime != lastCheck {
+		atomic.CompareAndSwapInt64(&cm.lastGlobalCheck, lastCheck, currentTime)
+		atomic.StoreInt64(&cm.globalRateLimit, 0)
+		return false
+	}
+
+	rate := atomic.LoadInt64(&cm.globalRateLimit)
+	return rate > GLOBAL_RATE_LIMIT
+}
+
+// GetGlobalRateLimitDelay returns the delay to apply for global rate limiting
+func (cm *ConnectionMonitor) GetGlobalRateLimitDelay() time.Duration {
+	const GLOBAL_RATE_LIMIT = 1000
+
+	rate := atomic.LoadInt64(&cm.globalRateLimit)
+	if rate <= GLOBAL_RATE_LIMIT {
+		return 0
+	}
+
+	// Progressive delay based on how much we exceed the limit
+	excess := rate - GLOBAL_RATE_LIMIT
+	if excess > 500 {
+		return 500 * time.Millisecond
+	}
+	if excess > 200 {
+		return 200 * time.Millisecond
+	}
+	return 50 * time.Millisecond
+}
+
+// GetStats returns a formatted statistics string
 func (cm *ConnectionMonitor) GetStats() string {
 	active := atomic.LoadInt64(&cm.activeConnections)
 	attempted := atomic.LoadInt64(&cm.totalAttempted)
 	succeeded := atomic.LoadInt64(&cm.totalSucceeded)
 	failed := atomic.LoadInt64(&cm.totalFailed)
 	peak := atomic.LoadInt64(&cm.peakConnections)
-	
+	warnings := atomic.LoadInt64(&cm.throttleWarnings)
+
 	elapsed := time.Since(cm.startTime).Seconds()
-	attemptsPerSec := float64(attempted) / elapsed
-	
+	attemptsPerSec := float64(attempted) / mathMax(1, elapsed)
+
+	successRate := 0.0
+	if attempted > 0 {
+		successRate = float64(succeeded) / float64(attempted) * 100
+	}
+
 	return fmt.Sprintf(`
 === Connection Monitor ===
-🔗 Active: %d
-📊 Peak: %d
-✅ Succeeded: %d
-❌ Failed: %d
-📈 Rate: %.2f/sec
-⏱️ Uptime: %.0fs
+🔗 Active Connections: %d
+📊 Peak Connections:    %d
+✅ Successful:          %d
+❌ Failed:              %d
+📈 Success Rate:        %.2f%%
+⚡ Rate:                %.2f/sec
+⏱️  Uptime:             %.0fs
+⚠️  Throttle Warnings:  %d
 ========================
-`, active, peak, succeeded, failed, attemptsPerSec, elapsed)
+`, active, peak, succeeded, failed, successRate, attemptsPerSec, elapsed, warnings)
 }
 
-// PrintStats prints statistics to console
+// PrintStats prints current statistics to console
 func (cm *ConnectionMonitor) PrintStats() {
 	fmt.Println(cm.GetStats())
 }
 
-// MonitorLoop continuously monitors and prints stats
-func (cm *ConnectionMonitor) MonitorLoop() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	
-	for range ticker.C {
-		active := cm.GetActiveCount()
-		
-		// Warning if too many connections
-		if active > 7000 {
-			fmt.Printf("⚠️  WARNING: %d active connections - system may be overloaded!\n", active)
-		}
-		
-		// Auto-suggest reducing workers if consistently high
-		if active > 6000 {
-			fmt.Println("💡 TIP: Consider reducing worker count with -w flag")
-		}
+// GetSummary returns a brief summary for monitoring
+func (cm *ConnectionMonitor) GetSummary() map[string]int64 {
+	return map[string]int64{
+		"active":    atomic.LoadInt64(&cm.activeConnections),
+		"peak":      atomic.LoadInt64(&cm.peakConnections),
+		"attempted": atomic.LoadInt64(&cm.totalAttempted),
+		"succeeded": atomic.LoadInt64(&cm.totalSucceeded),
+		"failed":    atomic.LoadInt64(&cm.totalFailed),
 	}
 }
 
-// ConnectionPool manages a pool of reusable connections (optional - more complex)
-type ConnectionPool struct {
-	mu          sync.Mutex
-	connections map[string][]*PooledConnection
-	maxPerHost  int
-	maxIdle     time.Duration
-}
-
-type PooledConnection struct {
-	targetString string
-	lastUsed     time.Time
-	inUse        bool
-	client       interface{} // Would be *grdp.Client
-}
-
-func NewConnectionPool(maxPerHost int, maxIdle time.Duration) *ConnectionPool {
-	pool := &ConnectionPool{
-		connections: make(map[string][]*PooledConnection),
-		maxPerHost:  maxPerHost,
-		maxIdle:     maxIdle,
+// mathMax returns the maximum of two float64 values
+func mathMax(a, b float64) float64 {
+	if a > b {
+		return a
 	}
-	
-	// Cleanup routine for idle connections
-	go pool.cleanupLoop()
-	
-	return pool
-}
-
-// Get retrieves a connection from pool or creates new one
-func (p *ConnectionPool) Get(targetString string) *PooledConnection {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	// Try to get existing connection
-	if conns, exists := p.connections[targetString]; exists {
-		for _, conn := range conns {
-			if !conn.inUse && time.Since(conn.lastUsed) < p.maxIdle {
-				conn.inUse = true
-				conn.lastUsed = time.Now()
-				return conn
-			}
-		}
-	}
-	
-	// No available connection, return nil (caller creates new one)
-	return nil
-}
-
-// Put returns a connection to the pool
-func (p *ConnectionPool) Put(conn *PooledConnection) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	conn.inUse = false
-	conn.lastUsed = time.Now()
-	
-	// Add to pool if not at max
-	if conns, exists := p.connections[conn.targetString]; exists {
-		if len(conns) < p.maxPerHost {
-			p.connections[conn.targetString] = append(conns, conn)
-		}
-	} else {
-		p.connections[conn.targetString] = []*PooledConnection{conn}
-	}
-}
-
-// cleanupLoop removes idle connections
-func (p *ConnectionPool) cleanupLoop() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	
-	for range ticker.C {
-		p.mu.Lock()
-		for target, conns := range p.connections {
-			active := make([]*PooledConnection, 0)
-			for _, conn := range conns {
-				if !conn.inUse && time.Since(conn.lastUsed) > p.maxIdle {
-					// Close idle connection here
-					continue
-				}
-				active = append(active, conn)
-			}
-			p.connections[target] = active
-		}
-		p.mu.Unlock()
-	}
-}
-
-// GetPoolStats returns pool statistics
-func (p *ConnectionPool) GetPoolStats() map[string]int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	
-	stats := make(map[string]int)
-	totalPooled := 0
-	totalInUse := 0
-	
-	for _, conns := range p.connections {
-		totalPooled += len(conns)
-		for _, conn := range conns {
-			if conn.inUse {
-				totalInUse++
-			}
-		}
-	}
-	
-	stats["total_pooled"] = totalPooled
-	stats["total_in_use"] = totalInUse
-	stats["total_idle"] = totalPooled - totalInUse
-	
-	return stats
+	return b
 }
