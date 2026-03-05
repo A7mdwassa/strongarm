@@ -259,29 +259,39 @@ func logVerbose(format string, args ...interface{}) {
 	fmt.Printf("[%s] [VERBOSE] %s\n", timestamp, fmt.Sprintf(format, args...))
 }
 
+// Global credential deduplication map
+var reportedCredentials = &sync.Map{}
+
 // writeCredentialsImmediately writes credentials to file with fsync for crash safety
 var fileWriteMutex sync.Mutex
 
-func writeCredentialsImmediately(credentials string) {
+func writeCredentialsImmediately(credentials string) bool {
+	// Check if already reported (deduplication)
+	if _, exists := reportedCredentials.Load(credentials); exists {
+		return false
+	}
+	reportedCredentials.Store(credentials, true)
+
 	fileWriteMutex.Lock()
 	defer fileWriteMutex.Unlock()
 
 	file, err := os.OpenFile("goods.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Printf("⚠️  Failed to open goods.txt: %v\n", err)
-		return
+		return false
 	}
 	defer file.Close()
 
 	if _, err := file.WriteString(credentials); err != nil {
 		fmt.Printf("⚠️  Failed to write to goods.txt: %v\n", err)
-		return
+		return false
 	}
 
 	// Force sync to disk - critical for crash recovery
 	if err := file.Sync(); err != nil {
 		fmt.Printf("⚠️  Failed to sync goods.txt: %v\n", err)
 	}
+	return true
 }
 
 // loadSuccessfulTargets loads already discovered credentials from goods.txt
