@@ -331,6 +331,7 @@ func (c *Client) recvPDU(s []byte) {
 			return
 		}
 		if p.ShareCtrlHeader.PDUType == PDUTYPE_DEACTIVATEALLPDU {
+			c.Emit("deactivate")
 			c.transport.On("data", c.recvDemandActivePDU)
 		}
 	}

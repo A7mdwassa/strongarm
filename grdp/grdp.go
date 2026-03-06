@@ -180,6 +180,7 @@ func (g *Client) LoginForSSL(domain, user, pwd string) error {
 
 // LoginForRDP attempts authentication using standard RDP protocol (fallback)
 // Returns nil on success, error on failure
+// NOTE: NoNLA authentication is unreliable - we use multiple heuristics
 func (g *Client) LoginForRDP(domain, user, pwd string) error {
 	// Quick connection timeout
 	conn, err := net.DialTimeout("tcp", g.Host, 2*time.Second)
@@ -223,15 +224,22 @@ func (g *Client) LoginForRDP(domain, user, pwd string) error {
 		return fmt.Errorf("x224 connect failed: %v", err)
 	}
 
-	// Wait for authentication result
+	// Wait for authentication result with multiple indicators
 	done := make(chan struct{})
 	var authErr error
-	var updateCount int
 	var mu sync.Mutex
+
+	// Track multiple success indicators
+	var receivedReady bool
+	var receivedSuccess bool
+	var receivedError bool
+	var updateCount int
+	var deactivated bool
 
 	g.pdu.On("error", func(e error) {
 		mu.Lock()
 		authErr = e
+		receivedError = true
 		mu.Unlock()
 		close(done)
 	})
@@ -244,6 +252,16 @@ func (g *Client) LoginForRDP(domain, user, pwd string) error {
 	})
 
 	g.pdu.On("success", func() {
+		mu.Lock()
+		receivedSuccess = true
+		mu.Unlock()
+		// Don't close - wait for ready or more events
+	})
+
+	g.pdu.On("ready", func() {
+		mu.Lock()
+		receivedReady = true
+		mu.Unlock()
 		close(done)
 	})
 
@@ -253,31 +271,60 @@ func (g *Client) LoginForRDP(domain, user, pwd string) error {
 		mu.Unlock()
 	})
 
+	g.pdu.On("deactivate", func() {
+		mu.Lock()
+		deactivated = true
+		mu.Unlock()
+		close(done)
+	})
+
 	// Wait for completion or timeout
 	select {
 	case <-done:
 		// Event triggered
 	case <-time.After(3 * time.Second):
-		// Timeout - check if we got updates (indicates successful auth)
+		// Timeout
 	}
 
 	mu.Lock()
+	finalReady := receivedReady
+	finalSuccess := receivedSuccess
+	finalError := receivedError
 	finalUpdates := updateCount
+	finalDeactivated := deactivated
 	mu.Unlock()
 
 	// Close connection
 	g.Close()
 
-	// If we received screen updates, authentication likely succeeded
-	if finalUpdates > 0 {
-		return nil
+	// Analyze results with stricter criteria
+	// A deactivation after connection usually means login screen (not authenticated)
+	if finalDeactivated {
+		return errors.New("session deactivated (likely login screen only)")
 	}
 
-	if authErr != nil {
+	// If we got an error, authentication definitely failed
+	if finalError {
 		return authErr
 	}
 
-	return errors.New("authentication failed")
+	// For NoNLA, "ready" is the strongest indicator of successful authentication
+	// Screen updates alone are NOT reliable (login screen generates updates)
+	if finalReady {
+		return nil
+	}
+
+	// If we only got updates without ready, it's likely just the login screen
+	if finalUpdates > 0 && !finalReady {
+		return errors.New("received updates but no ready state (likely login screen)")
+	}
+
+	// If we got success but no ready, be conservative
+	if finalSuccess && !finalReady {
+		return errors.New("success event without ready state")
+	}
+
+	return errors.New("authentication failed - no positive confirmation")
 }
 
 // Login attempts SSL authentication first, then falls back to RDP
