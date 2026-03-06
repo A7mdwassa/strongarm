@@ -131,51 +131,103 @@ func (g *Client) LoginForSSL(domain, user, pwd string) error {
 		return fmt.Errorf("x224 connect failed: %v", err)
 	}
 
-	// Wait for authentication result with timeout
-	done := make(chan error, 1)
+	// Wait for authentication result with session verification
+	done := make(chan struct{})
 	var resultErr error
+	var mu sync.Mutex
+
+	// Track session state for verification
+	var receivedReady bool
+	var receivedError bool
+	var updateCount int
+	var deactivated bool
+	var licenseError bool
 
 	g.pdu.On("error", func(e error) {
+		mu.Lock()
 		resultErr = e
-		select {
-		case done <- e:
-		default:
-		}
+		receivedError = true
+		mu.Unlock()
+		close(done)
 	})
 
 	g.pdu.On("close", func() {
+		mu.Lock()
 		resultErr = errors.New("connection closed")
-		select {
-		case done <- resultErr:
-		default:
-		}
+		mu.Unlock()
+		close(done)
 	})
 
 	g.pdu.On("success", func() {
-		select {
-		case done <- nil:
-		default:
-		}
+		mu.Lock()
+		receivedReady = true
+		mu.Unlock()
 	})
 
 	g.pdu.On("ready", func() {
-		select {
-		case done <- nil:
-		default:
-		}
+		mu.Lock()
+		receivedReady = true
+		mu.Unlock()
+	})
+
+	g.pdu.On("update", func(rectangles []pdu.BitmapData) {
+		mu.Lock()
+		updateCount++
+		mu.Unlock()
+	})
+
+	g.pdu.On("deactivate", func() {
+		mu.Lock()
+		deactivated = true
+		mu.Unlock()
+		close(done)
+	})
+
+	g.pdu.On("license_error", func() {
+		mu.Lock()
+		licenseError = true
+		mu.Unlock()
+		close(done)
 	})
 
 	// Wait for result or timeout
 	select {
-	case err := <-done:
-		if err != nil {
-			g.Close()
-		}
-		return err
+	case <-done:
+		// Event triggered
 	case <-time.After(5 * time.Second):
-		g.Close()
-		return errors.New("authentication timeout")
 	}
+
+	mu.Lock()
+	finalReady := receivedReady
+	finalError := receivedError
+	finalUpdates := updateCount
+	finalDeactivated := deactivated
+	finalLicenseError := licenseError
+	mu.Unlock()
+
+	g.Close()
+
+	// Definite failures - NLA passed but session rejected
+	if finalLicenseError || finalDeactivated {
+		return errors.New("NLA passed but session rejected at login")
+	}
+
+	if finalError {
+		return resultErr
+	}
+
+	// For NLA, require ready state + updates to confirm we reached a session
+	// NLA can pass NTLM but fail at Windows logon screen
+	if finalReady && finalUpdates > 0 {
+		return nil // ✅ Confirmed session (NLA + Windows login)
+	}
+
+	// NLA passed but no session established = login screen rejection
+	if finalReady && finalUpdates == 0 {
+		return errors.New("NLA passed but no session updates (rejected at login)")
+	}
+
+	return errors.New("authentication failed")
 }
 
 // LoginForRDP attempts authentication using standard RDP protocol (fallback)
@@ -231,7 +283,6 @@ func (g *Client) LoginForRDP(domain, user, pwd string) error {
 
 	// Track multiple success indicators
 	var receivedReady bool
-	var receivedSuccess bool
 	var receivedError bool
 	var updateCount int
 	var deactivated bool
@@ -249,13 +300,6 @@ func (g *Client) LoginForRDP(domain, user, pwd string) error {
 		authErr = errors.New("connection closed")
 		mu.Unlock()
 		close(done)
-	})
-
-	g.pdu.On("success", func() {
-		mu.Lock()
-		receivedSuccess = true
-		mu.Unlock()
-		// Don't close - wait for ready or more events
 	})
 
 	g.pdu.On("ready", func() {
@@ -278,17 +322,24 @@ func (g *Client) LoginForRDP(domain, user, pwd string) error {
 		close(done)
 	})
 
+	g.pdu.On("license_error", func() {
+		mu.Lock()
+		authErr = errors.New("license error")
+		receivedError = true
+		mu.Unlock()
+		close(done)
+	})
+
 	// Wait for completion or timeout
 	select {
 	case <-done:
 		// Event triggered
-	case <-time.After(3 * time.Second):
-		// Timeout
+	case <-time.After(5 * time.Second):
+		// Extended wait to verify session
 	}
 
 	mu.Lock()
 	finalReady := receivedReady
-	finalSuccess := receivedSuccess
 	finalError := receivedError
 	finalUpdates := updateCount
 	finalDeactivated := deactivated
@@ -297,10 +348,9 @@ func (g *Client) LoginForRDP(domain, user, pwd string) error {
 	// Close connection
 	g.Close()
 
-	// Analyze results with stricter criteria
-	// A deactivation after connection usually means login screen (not authenticated)
+	// Definite failures - connected but rejected at login
 	if finalDeactivated {
-		return errors.New("session deactivated (likely login screen only)")
+		return errors.New("rejected at login screen")
 	}
 
 	// If we got an error, authentication definitely failed
@@ -308,23 +358,18 @@ func (g *Client) LoginForRDP(domain, user, pwd string) error {
 		return authErr
 	}
 
-	// For NoNLA, "ready" is the strongest indicator of successful authentication
-	// Screen updates alone are NOT reliable (login screen generates updates)
-	if finalReady {
-		return nil
+	// Require ready + updates to confirm we reached a session
+	// Connection alone doesn't mean credentials are valid
+	if finalReady && finalUpdates > 0 {
+		return nil // ✅ Confirmed session
 	}
 
-	// If we only got updates without ready, it's likely just the login screen
-	if finalUpdates > 0 && !finalReady {
-		return errors.New("received updates but no ready state (likely login screen)")
+	// Connected but no session = rejected at login screen
+	if finalReady && finalUpdates == 0 {
+		return errors.New("connected but rejected at login")
 	}
 
-	// If we got success but no ready, be conservative
-	if finalSuccess && !finalReady {
-		return errors.New("success event without ready state")
-	}
-
-	return errors.New("authentication failed - no positive confirmation")
+	return errors.New("authentication failed")
 }
 
 // Login attempts SSL authentication first, then falls back to RDP
