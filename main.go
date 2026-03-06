@@ -40,6 +40,8 @@ var (
 	nlaCheckerThreads int
 	bruteNLAOnly      bool
 	forceRescan       bool // If true, don't skip already-compromised targets
+	enableHoneypotCheck bool // Enable honeypot detection
+	honeypotThreads    int   // Threads for honeypot detection
 
 	// Telegram configuration (load from env or flags for security)
 	telegramBotToken string
@@ -408,6 +410,8 @@ func init() {
 	flag.IntVar(&nlaCheckerThreads, "nlt", 0, "Number of threads for NLA checker (default: CPU*4)")
 	flag.BoolVar(&bruteNLAOnly, "nla-only", false, "Only brute-force NLA-enabled targets (requires -nlcheck)")
 	flag.BoolVar(&forceRescan, "force", false, "Force re-scan of all targets (don't skip already-compromised)")
+	flag.BoolVar(&enableHoneypotCheck, "honeypot", false, "Enable honeypot detection (skip honeypot targets)")
+	flag.IntVar(&honeypotThreads, "hpt", 50, "Number of threads for honeypot detection")
 
 	// Telegram configuration flags
 	flag.StringVar(&telegramBotToken, "tg-token", "", "Telegram bot token (or set TELEGRAM_BOT_TOKEN)")
@@ -551,6 +555,38 @@ func main() {
 		}
 
 		fmt.Println()
+	}
+
+	// Honeypot Detection (if enabled)
+	var honeypotDetector *HoneypotDetector
+	if enableHoneypotCheck {
+		honeypotDetector = RunHoneypotScan(currentTask.Targets, honeypotThreads)
+
+		// Save honeypot results
+		if err := honeypotDetector.SaveHoneypots(); err != nil {
+			fmt.Printf("⚠️  Error saving honeypot results: %v\n", err)
+		} else {
+			fmt.Println("Honeypots saved to: honeypots.txt")
+		}
+
+		// Filter out honeypots from targets
+		var cleanTargets []string
+		for _, target := range currentTask.Targets {
+			if !honeypotDetector.IsHoneypot(target) {
+				cleanTargets = append(cleanTargets, target)
+			}
+		}
+
+		_, detected := honeypotDetector.GetStats()
+		fmt.Printf("🎯 Filtering honeypots: %d targets remaining (removed %d honeypots)\n", len(cleanTargets), detected)
+		fmt.Println()
+
+		currentTask.Targets = cleanTargets
+
+		if len(currentTask.Targets) == 0 {
+			fmt.Println("❌ No valid targets after honeypot filtering")
+			return
+		}
 	}
 
 	// Create job and dispatch to workers

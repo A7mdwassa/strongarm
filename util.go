@@ -332,3 +332,8 @@ func loadSuccessfulTargets() *sync.Map {
 
 	return successfulTargets
 }
+
+// createFile creates a file and returns the handle
+func createFile(filename string) (*os.File, error) {
+	return os.Create(filename)
+}
