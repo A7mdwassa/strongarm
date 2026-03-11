@@ -2,6 +2,7 @@ build.bat
 goods.txt
 detailed-results.txt
 test_creds/
+main_creds/
 bins/
 progress.gob
 in.txt
