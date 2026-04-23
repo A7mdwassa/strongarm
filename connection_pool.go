@@ -32,18 +32,28 @@ func (cm *ConnectionMonitor) IncrementActive() {
 	current := atomic.AddInt64(&cm.activeConnections, 1)
 	atomic.AddInt64(&cm.totalAttempted, 1)
 
-	// Atomically track peak connections
+	// Atomically track peak connections using optimized CAS pattern
 	for {
 		peak := atomic.LoadInt64(&cm.peakConnections)
 		if current <= peak {
 			break
 		}
-		if atomic.CompareAndSwapInt64(&cm.peakConnections, peak, current) {
+		newPeak := current
+		if atomic.CompareAndSwapInt64(&cm.peakConnections, peak, newPeak) {
 			break
 		}
 	}
 
-	// Update global rate limit counter
+	// Update global rate limit counter using monotonic timestamp-based reset
+	currentTime := time.Now().UnixNano() // Use nanoseconds for better precision
+	lastCheck := atomic.LoadInt64(&cm.lastGlobalCheck)
+
+	// Reset counter every second with nanosecond precision
+	if currentTime-lastCheck >= 1000000000 { // 1 billion ns = 1 second
+		atomic.CompareAndSwapInt64(&cm.lastGlobalCheck, lastCheck, currentTime-1000000000)
+		atomic.StoreInt64(&cm.globalRateLimit, 0)
+	}
+
 	atomic.AddInt64(&cm.globalRateLimit, 1)
 }
 

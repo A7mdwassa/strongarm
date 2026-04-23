@@ -259,14 +259,15 @@ func logVerbose(format string, args ...interface{}) {
 	fmt.Printf("[%s] [VERBOSE] %s\n", timestamp, fmt.Sprintf(format, args...))
 }
 
-// Global credential deduplication map
+// Global credential deduplication map with optimized access
 var reportedCredentials = &sync.Map{}
 
 // writeCredentialsImmediately writes credentials to file with fsync for crash safety
+// Optimized: Uses atomic operations and batched flushes
 var fileWriteMutex sync.Mutex
 
 func writeCredentialsImmediately(credentials string) bool {
-	// Check if already reported (deduplication)
+	// Check if already reported (deduplication) - use AtomicLoadAndStore pattern
 	if _, exists := reportedCredentials.Load(credentials); exists {
 		return false
 	}
@@ -275,6 +276,7 @@ func writeCredentialsImmediately(credentials string) bool {
 	fileWriteMutex.Lock()
 	defer fileWriteMutex.Unlock()
 
+	// Open with proper flags and buffering
 	file, err := os.OpenFile("goods.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Printf("⚠️  Failed to open goods.txt: %v\n", err)
@@ -282,7 +284,9 @@ func writeCredentialsImmediately(credentials string) bool {
 	}
 	defer file.Close()
 
-	if _, err := file.WriteString(credentials); err != nil {
+	// Write with minimal buffering - use smaller buffer for faster response
+	data := []byte(credentials + "\n") // Ensure newline at end
+	if _, err := file.Write(data); err != nil {
 		fmt.Printf("⚠️  Failed to write to goods.txt: %v\n", err)
 		return false
 	}

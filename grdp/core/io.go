@@ -9,6 +9,17 @@ import (
 type ReadBytesComplete func(result []byte, err error)
 
 func StartReadBytes(len int, r io.Reader, cb ReadBytesComplete) {
+	const maxGRDPSegment = 65535 // TCP MSS limit; also covers UDP MTU for safety
+
+	// Bounds checking to prevent panic on malformed/corrupted length values.
+	// GRDP runs over UDP/TPKT but uses a conservative bound matching the underlying transport's limits.
+	if len <= 0 || len > maxGRDPSegment {
+		go func() {
+			cb(nil, io.ErrUnexpectedEOF)
+		}()
+		return
+	}
+	
 	b := make([]byte, len)
 	go func() {
 		_, err := io.ReadFull(r, b)
@@ -18,6 +29,11 @@ func StartReadBytes(len int, r io.Reader, cb ReadBytesComplete) {
 }
 
 func ReadBytes(len int, r io.Reader) ([]byte, error) {
+	// Bounds checking
+	if len <= 0 || len > 65535 {
+		return nil, io.ErrUnexpectedEOF
+	}
+	
 	b := make([]byte, len)
 	length, err := io.ReadFull(r, b)
 	return b[:length], err
@@ -35,77 +51,80 @@ func ReadUInt8(r io.Reader) (uint8, error) {
 
 func ReadUint16LE(r io.Reader) (uint16, error) {
 	b := make([]byte, 2)
-	_, err := io.ReadFull(r, b)
-	if err != nil {
-		return 0, nil
+	n, err := io.ReadFull(r, b)
+	if n < 2 || err != nil {
+		return binary.LittleEndian.Uint16(b), err
 	}
 	return binary.LittleEndian.Uint16(b), nil
 }
 
 func ReadUint16BE(r io.Reader) (uint16, error) {
 	b := make([]byte, 2)
-	_, err := io.ReadFull(r, b)
-	if err != nil {
-		return 0, nil
+	n, err := io.ReadFull(r, b)
+	if n < 2 || err != nil {
+		return binary.BigEndian.Uint16(b), err
 	}
 	return binary.BigEndian.Uint16(b), nil
 }
 
 func ReadUInt32LE(r io.Reader) (uint32, error) {
 	b := make([]byte, 4)
-	_, err := io.ReadFull(r, b)
-	if err != nil {
-		return 0, nil
+	n, err := io.ReadFull(r, b)
+	if n < 4 || err != nil {
+		return binary.LittleEndian.Uint32(b), err
 	}
 	return binary.LittleEndian.Uint32(b), nil
 }
 
 func ReadUInt32BE(r io.Reader) (uint32, error) {
 	b := make([]byte, 4)
-	_, err := io.ReadFull(r, b)
-	if err != nil {
-		return 0, nil
+	n, err := io.ReadFull(r, b)
+	if n < 4 || err != nil {
+		return binary.BigEndian.Uint32(b), err
 	}
 	return binary.BigEndian.Uint32(b), nil
 }
 
+// writeBuf1 is a reused buffer for single-byte writes to reduce heap allocations.
+var writeBuf1 [1]byte
+
 func WriteByte(data byte, w io.Writer) (int, error) {
-	b := make([]byte, 1)
-	b[0] = byte(data)
-	return w.Write(b)
+	writeBuf1[0] = data
+	return w.Write(writeBuf1[:])
 }
 
 func WriteBytes(data []byte, w io.Writer) (int, error) {
 	return w.Write(data)
 }
 
+// writeBuf2 is a reused buffer for 2-byte writes.
+var writeBuf2 [2]byte
+
 func WriteUInt8(data uint8, w io.Writer) (int, error) {
-	b := make([]byte, 1)
-	b[0] = byte(data)
-	return w.Write(b)
+	writeBuf2[0] = byte(data)
+	return w.Write(writeBuf2[:])
 }
 
 func WriteUInt16BE(data uint16, w io.Writer) (int, error) {
-	b := make([]byte, 2)
-	binary.BigEndian.PutUint16(b, data)
+	b := binary.BigEndian.AppendUint16(nil, data)
 	return w.Write(b)
 }
 
 func WriteUInt16LE(data uint16, w io.Writer) (int, error) {
-	b := make([]byte, 2)
-	binary.LittleEndian.PutUint16(b, data)
+	b := binary.LittleEndian.AppendUint16(nil, data)
 	return w.Write(b)
 }
 
+// writeBuf4 is a reused buffer for 4-byte writes.
+var writeBuf4 [4]byte
+
 func WriteUInt32LE(data uint32, w io.Writer) (int, error) {
-	b := make([]byte, 4)
-	binary.LittleEndian.PutUint32(b, data)
+	b := binary.LittleEndian.AppendUint32(nil, data)
 	return w.Write(b)
 }
 
 func WriteUInt32BE(data uint32, w io.Writer) (int, error) {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, data)
+	b := binary.BigEndian.AppendUint32(nil, data)
 	return w.Write(b)
 }
 

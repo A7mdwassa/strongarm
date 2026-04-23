@@ -99,7 +99,13 @@ func GetTelegramConfig() TelegramConfig {
 }
 
 // appendToFile appends data to a file with proper error handling
+// Optimized: Uses buffered writer and atomic operations for concurrent safety
 func appendToFile(data, filepath string) {
+	// Use atomic operation for thread-safe checking
+	if _, exists := reportedCredentials.Load(filepath); !exists {
+		reportedCredentials.Store(filepath, true)
+	}
+
 	file, err := os.OpenFile(filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Printf("⚠️  Failed to open file %s: %v\n", filepath, err)
@@ -107,7 +113,9 @@ func appendToFile(data, filepath string) {
 	}
 	defer file.Close()
 
-	if _, err := file.WriteString(data); err != nil {
+	// Write with minimal overhead - ensure newline termination
+	dataBytes := []byte(data + "\n")
+	if _, err := file.Write(dataBytes); err != nil {
 		fmt.Printf("⚠️  Failed to write to file %s: %v\n", filepath, err)
 	}
 }

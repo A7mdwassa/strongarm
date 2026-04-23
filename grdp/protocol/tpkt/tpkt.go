@@ -194,6 +194,14 @@ func (t *TPKT) recvExtendedHeader(s []byte, err error) {
 	}
 	r := bytes.NewReader(s)
 	size, _ := core.ReadUint16BE(r)
+	
+	// Validate TPKT packet size to prevent panic
+	if size < 4 || size > 65535 {
+		glog.Error("tpkt invalid packet size:", size)
+		t.Emit("error", fmt.Errorf("invalid TPKT packet size: %d", size))
+		return
+	}
+	
 	glog.Debug("tpkt wait recvData:", size)
 	core.StartReadBytes(int(size-4), t.Conn, t.recvData)
 }
