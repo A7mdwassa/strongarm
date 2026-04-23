@@ -193,43 +193,69 @@ func (g *Client) LoginForSSL(domain, user, pwd string) error {
 	// Wait for result or timeout
 	select {
 	case <-done:
-		// Event triggered
+		// Event triggered - capture final state atomically
+		mu.Lock()
+		finalReady := receivedReady
+		finalError := receivedError
+		finalUpdates := updateCount
+		finalDeactivated := deactivated
+		finalLicenseError := licenseError
+		mu.Unlock()
+
+		g.Close()
+
+		// Definite failures - NLA passed but session rejected
+		if finalLicenseError || finalDeactivated {
+			return errors.New("NLA passed but session rejected at login")
+		}
+
+		if finalError {
+			return resultErr
+		}
+
+		// For NLA, require ready state + updates to confirm we reached a session
+		// NLA can pass NTLM but fail at Windows logon screen
+		if finalReady && finalUpdates > 0 {
+			return nil // ✅ Confirmed session (NLA + Windows login)
+		}
+
+		// NLA passed but no session established = login screen rejection
+		if finalReady && finalUpdates == 0 {
+			return errors.New("NLA passed but no session updates (rejected at login)")
+		}
+
+		return errors.New("authentication failed")
+
 	case <-time.After(5 * time.Second):
+		// Timeout - must capture state before closing to avoid race
+		mu.Lock()
+		finalReady := receivedReady
+		finalError := receivedError
+		finalUpdates := updateCount
+		finalDeactivated := deactivated
+		finalLicenseError := licenseError
+		mu.Unlock()
+
+		g.Close()
+
+		// Timeout with ready state = likely legitimate session (network hiccup)
+		if finalReady && finalUpdates > 0 {
+			return nil // ✅ Likely legit - timeout during active session
+		}
+
+		// Otherwise treat as failure
+		if finalLicenseError || finalDeactivated {
+			return errors.New("NLA passed but session rejected at login")
+		}
+
+		if finalError {
+			return resultErr
+		}
+
+		// No ready state = definitely failed
+		return errors.New("authentication failed (timeout)")
 	}
-
-	mu.Lock()
-	finalReady := receivedReady
-	finalError := receivedError
-	finalUpdates := updateCount
-	finalDeactivated := deactivated
-	finalLicenseError := licenseError
-	mu.Unlock()
-
-	g.Close()
-
-	// Definite failures - NLA passed but session rejected
-	if finalLicenseError || finalDeactivated {
-		return errors.New("NLA passed but session rejected at login")
-	}
-
-	if finalError {
-		return resultErr
-	}
-
-	// For NLA, require ready state + updates to confirm we reached a session
-	// NLA can pass NTLM but fail at Windows logon screen
-	if finalReady && finalUpdates > 0 {
-		return nil // ✅ Confirmed session (NLA + Windows login)
-	}
-
-	// NLA passed but no session established = login screen rejection
-	if finalReady && finalUpdates == 0 {
-		return errors.New("NLA passed but no session updates (rejected at login)")
-	}
-
-	return errors.New("authentication failed")
 }
-
 // LoginForRDP attempts authentication using standard RDP protocol (fallback)
 // Returns nil on success, error on failure
 // NOTE: NoNLA authentication is unreliable - we use multiple heuristics
@@ -333,45 +359,68 @@ func (g *Client) LoginForRDP(domain, user, pwd string) error {
 	// Wait for completion or timeout
 	select {
 	case <-done:
-		// Event triggered
+		// Event triggered - capture final state atomically
+		mu.Lock()
+		finalReady := receivedReady
+		finalError := receivedError
+		finalUpdates := updateCount
+		finalDeactivated := deactivated
+		mu.Unlock()
+
+		g.Close()
+
+		// Definite failures - connected but rejected at login
+		if finalDeactivated {
+			return errors.New("rejected at login screen")
+		}
+
+		// If we got an error, authentication definitely failed
+		if finalError {
+			return authErr
+		}
+
+		// Require ready + updates to confirm we reached a session
+		// Connection alone doesn't mean credentials are valid
+		if finalReady && finalUpdates > 0 {
+			return nil // ✅ Confirmed session
+		}
+
+		// Connected but no session = rejected at login screen
+		if finalReady && finalUpdates == 0 {
+			return errors.New("connected but rejected at login")
+		}
+
+		return errors.New("authentication failed")
+
 	case <-time.After(5 * time.Second):
-		// Extended wait to verify session
+		// Timeout - must capture state before closing to avoid race
+		mu.Lock()
+		finalReady := receivedReady
+		finalError := receivedError
+		finalUpdates := updateCount
+		finalDeactivated := deactivated
+		mu.Unlock()
+
+		g.Close()
+
+		// Timeout with ready state = likely legitimate session (network hiccup)
+		if finalReady && finalUpdates > 0 {
+			return nil // ✅ Likely legit - timeout during active session
+		}
+
+		// Otherwise treat as failure
+		if finalDeactivated {
+			return errors.New("rejected at login screen")
+		}
+
+		if finalError {
+			return authErr
+		}
+
+		// No ready state = definitely failed
+		return errors.New("authentication failed (timeout)")
 	}
-
-	mu.Lock()
-	finalReady := receivedReady
-	finalError := receivedError
-	finalUpdates := updateCount
-	finalDeactivated := deactivated
-	mu.Unlock()
-
-	// Close connection
-	g.Close()
-
-	// Definite failures - connected but rejected at login
-	if finalDeactivated {
-		return errors.New("rejected at login screen")
-	}
-
-	// If we got an error, authentication definitely failed
-	if finalError {
-		return authErr
-	}
-
-	// Require ready + updates to confirm we reached a session
-	// Connection alone doesn't mean credentials are valid
-	if finalReady && finalUpdates > 0 {
-		return nil // ✅ Confirmed session
-	}
-
-	// Connected but no session = rejected at login screen
-	if finalReady && finalUpdates == 0 {
-		return errors.New("connected but rejected at login")
-	}
-
-	return errors.New("authentication failed")
 }
-
 // Login attempts SSL authentication first, then falls back to RDP
 func Login(target, domain, username, password string) error {
 	g := NewClient(target, glog.NONE)

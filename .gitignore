@@ -6,3 +6,4 @@ main_creds/
 bins/
 progress.gob
 in.txt
+.claude/

@@ -293,9 +293,9 @@ func (s *NLAScanner) scanOnce(host string, port int) (NLAScanStatus, error) {
 		if crTpduType == TypeRDPNegRsp {
 			return NLAStatusNLA, nil
 		}
-		return NLAStatusRDP, nil
 	}
 
+	// Ensure default return path is explicit for clarity and maintainability
 	return NLAStatusRDP, nil
 }
 

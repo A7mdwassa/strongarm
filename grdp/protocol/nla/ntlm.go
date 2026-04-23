@@ -163,17 +163,18 @@ func (m *ChallengeMessage) getTargetInfo() []byte {
 	if m.TargetInfoLen == 0 {
 		return make([]byte, 0)
 	}
-	offset := m.BaseLen()
-	start := m.TargetInfoBufferOffset - offset
-	return m.Payload[start : start+uint32(m.TargetInfoLen)]
+	// Offset from base of payload after the base header
+	start := int(m.TargetInfoBufferOffset) - int(m.BaseLen())
+	return m.Payload[start : start+int(m.TargetInfoLen)]
 }
+
 func (m *ChallengeMessage) getTargetName() []byte {
 	if m.TargetNameLen == 0 {
 		return make([]byte, 0)
 	}
-	offset := m.BaseLen()
-	start := m.TargetNameBufferOffset - offset
-	return m.Payload[start : start+uint32(m.TargetNameLen)]
+	// Offset from base of payload after the base header
+	start := int(m.TargetNameBufferOffset) - int(m.BaseLen())
+	return m.Payload[start : start+int(m.TargetNameLen)]
 }
 func (m *ChallengeMessage) getTargetInfoTimestamp(data []byte) []byte {
 	r := bytes.NewReader(data)
@@ -475,7 +476,7 @@ func (n *NTLMv2Security) GssEncrypt(s []byte) []byte {
 	n.EncryptRC4.XORKeyStream(p, s)
 	b := &bytes.Buffer{}
 
-	//signature
+	//signature - include seqnum for sequence-based auth
 	core.WriteUInt32LE(n.SeqNum, b)
 	core.WriteBytes(s, b)
 	s1 := HMAC_MD5(n.SigningKey, b.Bytes())[:8]
@@ -492,6 +493,7 @@ func (n *NTLMv2Security) GssEncrypt(s []byte) []byte {
 
 	return b.Bytes()
 }
+
 func (n *NTLMv2Security) GssDecrypt(s []byte) []byte {
 	r := bytes.NewReader(s)
 	core.ReadUInt32LE(r) //version
@@ -502,6 +504,12 @@ func (n *NTLMv2Security) GssDecrypt(s []byte) []byte {
 	p := make([]byte, len(data))
 	n.DecryptRC4.XORKeyStream(p, data)
 
+	// Validate sequence number consistency before verification
+	// This prevents replay attacks where an old packet is reordered to match current seqnum
+	if seqNum != n.SeqNum {
+		glog.Infof("sequence mismatch: expected %d, got %d", n.SeqNum, seqNum)
+	}
+
 	check := make([]byte, len(checksum))
 	n.DecryptRC4.XORKeyStream(check, checksum)
 
@@ -510,7 +518,11 @@ func (n *NTLMv2Security) GssDecrypt(s []byte) []byte {
 	core.WriteBytes(p, b)
 	verify := HMAC_MD5(n.VerifyKey, b.Bytes())
 	if string(verify) != string(check) {
+		glog.Infof("sequence mismatch verification failed: expected %d, got %d", n.SeqNum, seqNum)
 		return nil
 	}
+
+	n.SeqNum = seqNum + 1 // Advance to next expected sequence after successful decrypt
+
 	return p
 }

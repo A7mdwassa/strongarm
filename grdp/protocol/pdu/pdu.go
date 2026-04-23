@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/whiterabb17/strongarm/grdp/core"
 	"github.com/whiterabb17/strongarm/grdp/emission"
@@ -122,6 +123,7 @@ type Client struct {
 	clientCoreData *gcc.ClientCoreData
 	remoteAppMode  bool
 	enableCliprdr  bool
+	mu             sync.Mutex
 }
 
 func NewClient(t core.Transport) *Client {
@@ -338,14 +340,12 @@ func (c *Client) recvPDU(s []byte) {
 }
 
 func (c *Client) RecvFastPath(secFlag byte, s []byte) {
-	//glog.Debug("PDU RecvFastPath", hex.EncodeToString(s))
 	glog.Debug("PDU RecvFastPath", secFlag&0x2 != 0)
 	r := bytes.NewReader(s)
 	for r.Len() > 0 {
 		p, err := readFastPathUpdatePDU(r)
 		if err != nil {
 			glog.Debug("readFastPathUpdatePDU:", err)
-			//continue
 			return
 		}
 		if p.UpdateHeader == FASTPATH_UPDATETYPE_BITMAP {
